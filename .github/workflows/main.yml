@@ -1,0 +1,41 @@
+name: Pterodactyl Panel (Temporary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      admin_email:
+        description: "Email admin Pterodactyl"
+        required: true
+        default: "admin@example.com"
+      admin_username:
+        description: "Username admin"
+        required: true
+        default: "yanzz"
+      admin_password:
+        description: "Password admin (min 8 karakter)"
+        required: true
+        default: "7819159772"
+      duration_minutes:
+        description: "Berapa menit panel hidup (max 350)"
+        required: true
+        default: "300"
+
+jobs:
+  pterodactyl:
+    name: Install & Run Pterodactyl Panel
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Info runner
+        run: |
+          echo "CPU: $(nproc), RAM:"; free -h
+          echo "OS:"; lsb_release -a 2>/dev/null
+
+      - name: Install dependencies (PHP, MariaDB, Redis, Nginx)
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+          sudo apt-get install -y software-properties-common ca-certificates curl gnupg lsb-release
+          
