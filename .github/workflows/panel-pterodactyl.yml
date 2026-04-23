@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       admin_email:
-        description: "Email admin Pterodactyl"
+        description: "Email admin"
         required: true
         default: "admin@example.com"
       admin_username:
@@ -12,30 +12,212 @@ on:
         required: true
         default: "yanzz"
       admin_password:
-        description: "Password admin (min 8 karakter)"
+        description: "Password admin (min 8 char)"
         required: true
         default: "7819159772"
       duration_minutes:
-        description: "Berapa menit panel hidup (max 350)"
+        description: "Berapa menit hidup (max 350)"
         required: true
         default: "300"
 
 jobs:
   pterodactyl:
-    name: Install & Run Pterodactyl Panel
     runs-on: ubuntu-latest
     timeout-minutes: 355
-
     steps:
-      - name: Info runner
-        run: |
-          echo "CPU: $(nproc), RAM:"; free -h
-          echo "OS:"; lsb_release -a 2>/dev/null
-
-      - name: Install dependencies (PHP, MariaDB, Redis, Nginx)
+      - name: Install dependencies
         run: |
           set -e
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -y
           sudo apt-get install -y software-properties-common ca-certificates curl gnupg lsb-release
-          
+          sudo add-apt-repository -y ppa:ondrej/php
+          sudo apt-get update -y
+          sudo apt-get install -y nginx mariadb-server redis-server tar unzip git \
+            php8.2 php8.2-fpm php8.2-cli php8.2-gd php8.2-mysql php8.2-mbstring \
+            php8.2-bcmath php8.2-xml php8.2-curl php8.2-zip php8.2-intl php8.2-sqlite3 composer
+          sudo systemctl enable --now mariadb redis-server php8.2-fpm nginx
+
+      - name: Setup database
+        run: |
+          sudo mysql -e "CREATE DATABASE panel;"
+          sudo mysql -e "CREATE USER 'pterodactyl'@'127.0.0.1' IDENTIFIED BY 'ptero_pw_temp';"
+          sudo mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1' WITH GRANT OPTION;"
+          sudo mysql -e "FLUSH PRIVILEGES;"
+
+      - name: Download Pterodactyl Panel
+        run: |
+          sudo mkdir -p /var/www/pterodactyl
+          cd /var/www/pterodactyl
+          sudo curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
+          sudo tar -xzf panel.tar.gz
+          sudo rm panel.tar.gz
+          sudo chmod -R 755 storage/* bootstrap/cache/
+          sudo cp .env.example .env
+          sudo composer install --no-dev --optimize-autoloader --working-dir=/var/www/pterodactyl --no-interaction
+
+      - name: Cloudflared tunnel (URL publik)
+        id: tunnel
+        run: |
+          curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          nohup cloudflared tunnel --url http://localhost:80 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
+            [ -n "$URL" ] && { echo "panel_url=$URL" >> "$GITHUB_OUTPUT"; echo "URL: $URL"; break; }
+            sleep 2
+          done
+
+      - name: Konfigurasi panel
+        env:
+          PANEL_URL: ${{ steps.tunnel.outputs.panel_url }}
+          ADMIN_EMAIL: ${{ github.event.inputs.admin_email }}
+        run: |
+          cd /var/www/pterodactyl
+          sudo php artisan key:generate --force
+          sudo php artisan p:environment:setup --author="$ADMIN_EMAIL" --url="$PANEL_URL" \
+            --timezone="Asia/Jakarta" --cache="redis" --session="redis" --queue="redis" \
+            --redis-host="127.0.0.1" --redis-pass="null" --redis-port="6379" --settings-ui=true
+          sudo php artisan p:environment:database --host="127.0.0.1" --port="3306" \
+            --database="panel" --username="pterodactyl" --password="ptero_pw_temp"
+          sudo php artisan migrate --seed --force
+
+      - name: Buat user admin
+        env:
+          ADMIN_EMAIL: ${{ github.event.inputs.admin_email }}
+          ADMIN_USER: ${{ github.event.inputs.admin_username }}
+          ADMIN_PASS: ${{ github.event.inputs.admin_password }}
+        run: |
+          cd /var/www/pterodactyl
+          sudo php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" \
+            --name-first="Admin" --name-last="User" --password="$ADMIN_PASS" --admin=1
+          sudo chown -R www-data:www-data /var/www/pterodactyl/*      - name: Buat Location & Node
+        id: node
+        run: |
+          cd /var/www/pterodactyl
+          sudo php artisan tinker --execute="
+          use Pterodactyl\Services\Locations\LocationCreationService;
+          use Pterodactyl\Services\Nodes\NodeCreationService;
+          \$loc = app(LocationCreationService::class)->handle(['short' => 'local', 'long' => 'Runner Local']);
+          \$node = app(NodeCreationService::class)->handle([
+              'name' => 'node-runner',
+              'description' => 'Auto',
+              'location_id' => \$loc->id,
+              'public' => true,
+              'fqdn' => '127.0.0.1',
+              'scheme' => 'http',
+              'behind_proxy' => false,
+              'memory' => 4096,
+              'memory_overallocate' => 0,
+              'disk' => 8192,
+              'disk_overallocate' => 0,
+              'upload_size' => 100,
+              'daemon_listen' => 8080,
+              'daemon_sftp' => 2022,
+              'daemon_base' => '/var/lib/pterodactyl/volumes',
+          ]);
+          file_put_contents('/tmp/node_id', \$node->id);
+          " 2>&1 | tail -10
+          NODE_ID=$(cat /tmp/node_id)
+          echo "node_id=$NODE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Buat allocation port
+        env:
+          NODE_ID: ${{ steps.node.outputs.node_id }}
+        run: |
+          cd /var/www/pterodactyl
+          sudo php artisan p:node:allocations --node="$NODE_ID" --ip="127.0.0.1" --ports="25565-25570" || true
+
+      - name: Install Wings
+        env:
+          NODE_ID: ${{ steps.node.outputs.node_id }}
+        run: |
+          set -e
+          sudo mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl
+          sudo curl -L -o /usr/local/bin/wings \
+            https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_amd64
+          sudo chmod u+x /usr/local/bin/wings
+          cd /var/www/pterodactyl
+          sudo php artisan p:node:configuration "$NODE_ID" | sudo tee /etc/pterodactyl/config.yml > /dev/null
+
+      - name: Start Docker & Wings
+        run: |
+          sudo systemctl start docker 2>/dev/null || sudo service docker start || true
+          sudo nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /tmp/wings.log 2>&1 &
+          sleep 8
+          sudo tail -20 /tmp/wings.log || true
+
+      - name: Konfigurasi Nginx
+        run: |
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo tee /etc/nginx/sites-available/pterodactyl.conf >/dev/null <<'NGINX'
+          server {
+              listen 80 default_server;
+              server_name _;
+              root /var/www/pterodactyl/public;
+              index index.php;
+              client_max_body_size 100m;
+              location / { try_files $uri $uri/ /index.php?$query_string; }
+              location ~ \.php$ {
+                  fastcgi_split_path_info ^(.+\.php)(/.+)$;
+                  fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+                  fastcgi_index index.php;
+                  include fastcgi_params;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                  fastcgi_param HTTP_PROXY "";
+                  fastcgi_read_timeout 300;
+              }
+          }
+          NGINX
+          sudo ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+          sudo nginx -t && sudo systemctl reload nginx
+
+      - name: Queue worker & cron
+        run: |
+          sudo tee /etc/systemd/system/pteroq.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Pterodactyl Queue Worker
+          After=redis-server.service
+          [Service]
+          User=www-data
+          Group=www-data
+          Restart=always
+          ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+          RestartSec=5s
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now pteroq
+          ( sudo crontab -l 2>/dev/null; echo "* * * * * php /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1" ) | sudo crontab -
+
+      - name: ====== INFO LOGIN ======
+        env:
+          PANEL_URL: ${{ steps.tunnel.outputs.panel_url }}
+          ADMIN_USER: ${{ github.event.inputs.admin_username }}
+        run: |
+          echo "=========================================="
+          echo "  URL      : $PANEL_URL"
+          echo "  Username : $ADMIN_USER"
+          echo "  Password : (dari input)"
+          echo "=========================================="
+          {
+            echo "## Pterodactyl siap"
+            echo "- URL: $PANEL_URL"
+            echo "- Username: \`$ADMIN_USER\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: SSH via tmate
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false
+          detached: true
+
+      - name: Tahan hidup
+        run: |
+          MIN="${{ github.event.inputs.duration_minutes }}"
+          [ "$MIN" -gt 350 ] && MIN=350
+          for i in $(seq 1 "$MIN"); do
+            sleep 60
+            echo "[$i/$MIN] hidup - $(date -u +%H:%M:%S)"
+          done
