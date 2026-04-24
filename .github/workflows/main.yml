@@ -79,4 +79,381 @@ jobs:
         run: |
           curl -L --output cloudflared.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.
+          sudo dpkg -i cloudflared.deb
+          nohup cloudflared tunnel --url http://localhost:80 --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 &
+          echo "Tunggu URL muncul..."
+          for i in $(seq 1 30); do
+            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
+            if [ -n "$URL" ]; then
+              echo "panel_url=$URL" >> "$GITHUB_OUTPUT"
+              echo "URL Panel: $URL"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::Gagal dapatkan URL cloudflared"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+      - name: Konfigurasi Pterodactyl (.env, key, migrate, seed)
+        env:
+          PANEL_URL: ${{ steps.tunnel.outputs.panel_url }}
+          ADMIN_EMAIL: ${{ github.event.inputs.admin_email }}
+        run: |
+          cd /var/www/pterodactyl
+          sudo php artisan key:generate --force
+          sudo php artisan p:environment:setup \
+            --author="$ADMIN_EMAIL" \
+            --url="$PANEL_URL" \
+            --timezone="Asia/Jakarta" \
+            --cache="redis" \
+            --session="redis" \
+            --queue="redis" \
+            --redis-host="127.0.0.1" \
+            --redis-pass="null" \
+            --redis-port="6379" \
+            --settings-ui=true
+          sudo php artisan p:environment:database \
+            --host="127.0.0.1" \
+            --port="3306" \
+            --database="panel" \
+            --username="pterodactyl" \
+            --password="ptero_pw_temp"
+          sudo php artisan migrate --seed --force
+
+      - name: Buat user admin
+        env:
+          ADMIN_EMAIL: ${{ github.event.inputs.admin_email }}
+          ADMIN_USER: ${{ github.event.inputs.admin_username }}
+          ADMIN_PASS: ${{ github.event.inputs.admin_password }}
+        run: |
+          cd /var/www/pterodactyl
+          sudo php artisan p:user:make \
+            --email="$ADMIN_EMAIL" \
+            --username="$ADMIN_USER" \
+            --name-first="Admin" \
+            --name-last="User" \
+            --password="$ADMIN_PASS" \
+            --admin=1
+
+      - name: Set permission file Pterodactyl
+        run: |
+          sudo chown -R www-data:www-data /var/www/pterodactyl/*
+
+      - name: Buat Location & Node otomatis
+        id: node
+        run: |
+          set -e
+          sudo rm -f /tmp/nid /tmp/mknode.out
+          sudo tee /tmp/mknode.php >/dev/null <<'PHP'
+          <?php
+          use Pterodactyl\Services\Locations\LocationCreationService;
+          use Pterodactyl\Services\Nodes\NodeCreationService;
+          use Pterodactyl\Models\Location;
+          use Pterodactyl\Models\Node;
+
+          try {
+              $loc = Location::where('short', 'local')->first()
+                  ?: app(LocationCreationService::class)->handle([
+                      'short' => 'local',
+                      'long'  => 'Runner Local',
+                  ]);
+              echo "Location ID: {$loc->id}\n";
+
+              $node = Node::where('name', 'node-runner')->first()
+                  ?: app(NodeCreationService::class)->handle([
+                      'name'                 => 'node-runner',
+                      'description'          => 'Auto-created on GitHub Actions runner',
+                      'location_id'          => $loc->id,
+                      'public'               => true,
+                      'fqdn'                 => '127.0.0.1',
+                      'scheme'               => 'http',
+                      'behind_proxy'         => false,
+                      'memory'               => 4096,
+                      'memory_overallocate'  => 0,
+                      'disk'                 => 8192,
+                      'disk_overallocate'    => 0,
+                      'upload_size'          => 100,
+                      'daemon_listen'        => 8080,
+                      'daemon_sftp'          => 2022,
+                      'daemon_base'          => '/var/lib/pterodactyl/volumes',
+                  ]);
+              echo "Node ID: {$node->id}\n";
+              file_put_contents('/tmp/nid', (string) $node->id);
+          } catch (\Throwable $e) {
+              fwrite(STDERR, "ERROR: " . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n");
+              exit(1);
+          }
+          PHP
+          cd /var/www/pterodactyl
+          sudo php artisan tinker --no-interaction < /tmp/mknode.php 2>&1 | tee /tmp/mknode.out
+          if [ ! -s /tmp/nid ]; then
+            echo "::error::Gagal create node — /tmp/nid kosong"
+            exit 1
+          fi
+          NODE_ID=$(cat /tmp/nid | tr -dc '0-9')
+          if [ -z "$NODE_ID" ]; then
+            echo "::error::NODE_ID kosong"
+            exit 1
+          fi
+          echo "node_id=$NODE_ID" >> "$GITHUB_OUTPUT"
+          echo "==> NODE_ID=$NODE_ID"
+
+      - name: Buat allocation (port 25565-25570)
+        env:
+          NODE_ID: ${{ steps.node.outputs.node_id }}
+        run: |
+          set -e
+          if [ -z "$NODE_ID" ]; then
+            echo "::error::NODE_ID kosong di step allocation"
+            exit 1
+          fi
+          cd /var/www/pterodactyl
+          sudo php artisan p:node:allocations \
+            --node="$NODE_ID" \
+            --ip="127.0.0.1" \
+            --ports="25565-25570"
+
+      - name: Install & Start Wings + tunggu sampai HIJAU
+        env:
+          NODE_ID: ${{ steps.node.outputs.node_id }}
+        run: |
+          set -e
+          sudo mkdir -p /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) WINGS_ARCH="amd64" ;;
+            aarch64) WINGS_ARCH="arm64" ;;
+            *) echo "Arch $ARCH tidak didukung"; exit 1 ;;
+          esac
+
+          echo "==> [1/5] Download Wings"
+          sudo curl -fsSL -o /usr/local/bin/wings \
+            "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${WINGS_ARCH}"
+          sudo chmod +x /usr/local/bin/wings
+          /usr/local/bin/wings --version
+
+          echo "==> [2/5] Pastikan Docker jalan"
+          sudo systemctl start docker 2>/dev/null \
+            || sudo service docker start 2>/dev/null \
+            || (sudo nohup dockerd > /var/log/dockerd.log 2>&1 &)
+          for i in $(seq 1 15); do
+            sudo docker info >/dev/null 2>&1 && break
+            sleep 2
+          done
+          sudo docker info >/dev/null 2>&1 && echo "Docker OK" || {
+            echo "::error::Docker gagal start"
+            sudo tail -30 /var/log/dockerd.log 2>/dev/null
+            exit 1
+          }
+
+          echo "==> [3/5] Generate config Wings dari panel (Node $NODE_ID)"
+          cd /var/www/pterodactyl
+          sudo rm -f /etc/pterodactyl/config.yml
+          sudo php artisan p:node:configuration "$NODE_ID" | sudo tee /etc/pterodactyl/config.yml > /dev/null
+          if ! sudo grep -q "^uuid:" /etc/pterodactyl/config.yml; then
+            echo "::error::Config Wings invalid"
+            sudo cat /etc/pterodactyl/config.yml
+            exit 1
+          fi
+          echo "Config OK ($(sudo wc -l < /etc/pterodactyl/config.yml) baris)"
+
+          echo "==> [4/5] Start Wings"
+          sudo pkill -9 wings 2>/dev/null || true
+          sleep 2
+          sudo rm -f /var/log/wings.log
+          sudo bash -c "nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml > /var/log/wings.log 2>&1 &"
+
+          echo "==> [5/5] Tunggu sampai port 8080 listen + node HIJAU"
+          OK=0
+          for i in $(seq 1 30); do
+            sleep 2
+            if sudo ss -tlnp 2>/dev/null | grep -q ":8080"; then
+              if curl -fsS --max-time 3 http://127.0.0.1:8080/ >/dev/null 2>&1 \
+                 || curl -sS --max-time 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ | grep -qE "^(200|401|404)$"; then
+                echo "Wings HIDUP & responsif (percobaan $i)"
+                OK=1
+                break
+              fi
+            fi
+            echo "  ...nunggu wings ($i/30)"
+          done
+
+          if [ "$OK" != "1" ]; then
+            echo "::error::Wings GAGAL hidup setelah 60 detik"
+            echo "==> Log wings:"
+            sudo tail -40 /var/log/wings.log || true
+            echo "==> Log docker:"
+            sudo tail -20 /var/log/dockerd.log 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "==> Status final:"
+          sudo ss -tlnp | grep 8080
+          echo "Heart node sekarang HIJAU di panel."
+
+      - name: Auto-revive Wings tiap login SSH
+        run: |
+          sudo tee /usr/local/bin/wings-up >/dev/null <<'SH'
+          #!/bin/bash
+          if pgrep -x wings >/dev/null; then
+            echo "[wings-up] Wings masih hidup."
+          else
+            echo "[wings-up] Wings mati — menghidupkan ulang..."
+            (systemctl start docker 2>/dev/null || (nohup dockerd >/var/log/dockerd.log 2>&1 &))
+            sleep 3
+            NID=$(cd /var/www/pterodactyl && php artisan tinker --execute="echo \Pterodactyl\Models\Node::value('id');" 2>/dev/null | tail -1 | tr -dc '0-9')
+            if [ -n "$NID" ]; then
+              cd /var/www/pterodactyl && php artisan p:node:configuration "$NID" > /etc/pterodactyl/config.yml
+            fi
+            nohup /usr/local/bin/wings --config /etc/pterodactyl/config.yml >/var/log/wings.log 2>&1 &
+            sleep 5
+            if ss -tlnp 2>/dev/null | grep -q :8080; then
+              echo "[wings-up] OK — Wings nyala (port 8080 listen)."
+            else
+              echo "[wings-up] GAGAL — cek /var/log/wings.log"
+              tail -15 /var/log/wings.log
+            fi
+          fi
+          SH
+          sudo chmod +x /usr/local/bin/wings-up
+
+          sudo tee /etc/profile.d/zz-wings-up.sh >/dev/null <<'PROF'
+          if [ -n "$SSH_CONNECTION" ] || [ -n "$TMATE_VERSION" ]; then
+            sudo /usr/local/bin/wings-up 2>/dev/null || /usr/local/bin/wings-up
+          fi
+          PROF
+          sudo chmod +x /etc/profile.d/zz-wings-up.sh
+          echo "Auto-revive aktif. Tiap login SSH akan cek+hidupkan Wings."
+
+      - name: Konfigurasi Nginx untuk Pterodactyl
+        run: |
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo tee /etc/nginx/sites-available/pterodactyl.conf >/dev/null <<'NGINX'
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+              root /var/www/pterodactyl/public;
+              index index.php;
+
+              access_log /var/log/nginx/pterodactyl.app-access.log;
+              error_log  /var/log/nginx/pterodactyl.app-error.log error;
+
+              client_max_body_size 100m;
+              client_body_timeout 120s;
+              sendfile off;
+
+              location / {
+                  try_files $uri $uri/ /index.php?$query_string;
+              }
+
+              location ~ \.php$ {
+                  fastcgi_split_path_info ^(.+\.php)(/.+)$;
+                  fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+                  fastcgi_index index.php;
+                  include fastcgi_params;
+                  fastcgi_param PHP_VALUE "upload_max_filesize = 100M \n post_max_size=100M";
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                  fastcgi_param HTTP_PROXY "";
+                  fastcgi_intercept_errors off;
+                  fastcgi_buffer_size 16k;
+                  fastcgi_buffers 4 16k;
+                  fastcgi_connect_timeout 300;
+                  fastcgi_send_timeout 300;
+                  fastcgi_read_timeout 300;
+              }
+          }
+          NGINX
+          sudo ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+      - name: Setup queue worker & cron
+        run: |
+          sudo tee /etc/systemd/system/pteroq.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Pterodactyl Queue Worker
+          After=redis-server.service
+
+          [Service]
+          User=www-data
+          Group=www-data
+          Restart=always
+          ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
+          StartLimitInterval=180
+          StartLimitBurst=30
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now pteroq
+          ( sudo crontab -l 2>/dev/null; echo "* * * * * php /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1" ) | sudo crontab -
+
+      - name: Tampilkan info login
+        env:
+          PANEL_URL: ${{ steps.tunnel.outputs.panel_url }}
+          ADMIN_USER: ${{ github.event.inputs.admin_username }}
+        run: |
+          echo "============================================"
+          echo "  PTERODACTYL PANEL SIAP"
+          echo "============================================"
+          echo "  URL      : $PANEL_URL"
+          echo "  Username : $ADMIN_USER"
+          echo "  Password : (yang kamu isi di input)"
+          echo "============================================"
+          {
+            echo "## Pterodactyl Panel siap"
+            echo ""
+            echo "- **URL**: $PANEL_URL"
+            echo "- **Username**: \`$ADMIN_USER\`"
+            echo "- **Password**: (dari input workflow)"
+            echo ""
+            echo "Catatan: panel ini sementara, mati saat workflow selesai."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Buka SSH session via tmate
+        id: tmate
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false
+          detached: true
+
+      - name: Ambil URL SSH tmate
+        id: sshurl
+        run: |
+          sleep 5
+          TMATE=$(sudo tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || echo "")
+          echo "tmate_url=$TMATE" >> "$GITHUB_OUTPUT"
+
+      - name: Jalankan bot Telegram
+        env:
+          TG_TOKEN: ${{ github.event.inputs.telegram_token }}
+          TG_CHAT_ID: ${{ github.event.inputs.telegram_chat_id }}
+          PANEL_URL: ${{ steps.tunnel.outputs.panel_url }}
+          TMATE_URL: ${{ steps.sshurl.outputs.tmate_url }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "Token/chat_id kosong, bot di-skip"
+            exit 0
+          fi
+          sudo -E nohup python3 .github/scripts/telegram-bot.py \
+            > /tmp/bot.log 2>&1 &
+          sleep 3
+          echo "Bot status:"
+          tail -10 /tmp/bot.log || true
+
+      - name: Tahan panel tetap hidup
+        run: |
+          MIN="${{ github.event.inputs.duration_minutes }}"
+          if [ "$MIN" -gt 350 ]; then MIN=350; fi
+          echo "Panel akan hidup $MIN menit."
+          for i in $(seq 1 "$MIN"); do
+            sleep 60
+            echo "[$i/$MIN menit] panel hidup — $(date -u +%H:%M:%S)"
+          done
